@@ -37,7 +37,7 @@ from .jsonrpc import VerifyingJSONRPCServer
 from .version import ELECTRUM_VERSION
 from .network import Network
 from .util import (json_decode, DaemonThread, print_error, to_string,
-                   create_and_start_event_loop)
+                   create_and_start_event_loop, profiler)
 from .wallet import Wallet, Abstract_Wallet
 from .storage import WalletStorage
 from .commands import known_commands, Commands
@@ -121,6 +121,7 @@ def get_rpc_credentials(config: SimpleConfig) -> Tuple[str, str]:
 
 class Daemon(DaemonThread):
 
+    @profiler
     def __init__(self, config: SimpleConfig, fd=None, *, listen_jsonrpc=True):
         DaemonThread.__init__(self)
         self.config = config
@@ -318,12 +319,12 @@ class Daemon(DaemonThread):
         DaemonThread.stop(self)
 
     def init_gui(self, config, plugins):
+        threading.current_thread().setName('GUI')
         gui_name = config.get('gui', 'qt')
         if gui_name in ['lite', 'classic']:
             gui_name = 'qt'
         gui = __import__('electrum.gui.' + gui_name, fromlist=['electrum'])
         self.gui = gui.ElectrumGui(config, self, plugins)
-        threading.current_thread().setName('GUI')
         try:
             self.gui.main()
         except BaseException as e:

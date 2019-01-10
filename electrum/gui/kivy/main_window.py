@@ -9,9 +9,9 @@ import threading
 
 from electrum.bitcoin import TYPE_ADDRESS
 from electrum.storage import WalletStorage
-from electrum.wallet import Wallet
+from electrum.wallet import Wallet, InternalAddressCorruption
 from electrum.paymentrequest import InvoiceStore
-from electrum.util import profiler, InvalidPassword
+from electrum.util import profiler, InvalidPassword, send_exception_to_crash_reporter
 from electrum.plugin import run_hook
 from electrum.util import format_satoshis, format_satoshis_plain
 from electrum.paymentrequest import PR_UNPAID, PR_PAID, PR_UNKNOWN, PR_EXPIRED
@@ -109,6 +109,13 @@ class ElectrumWindow(App):
     def toggle_oneserver(self, x):
         self.oneserver = not self.oneserver
 
+    proxy_str = StringProperty('')
+    def update_proxy_str(self, proxy: dict):
+        mode = proxy.get('mode')
+        host = proxy.get('host')
+        port = proxy.get('port')
+        self.proxy_str = (host + ':' + port) if mode else _('None')
+
     def choose_server_dialog(self, popup):
         from .uix.dialogs.choice_dialog import ChoiceDialog
         protocol = 's'
@@ -126,10 +133,12 @@ class ElectrumWindow(App):
         chains = self.network.get_blockchains()
         def cb(name):
             with blockchain.blockchains_lock: blockchain_items = list(blockchain.blockchains.items())
-            for index, b in blockchain_items:
+            for chain_id, b in blockchain_items:
                 if name == b.get_name():
-                    self.network.run_from_another_thread(self.network.follow_chain_given_id(index))
-        names = [blockchain.blockchains[b].get_name() for b in chains]
+                    self.network.run_from_another_thread(self.network.follow_chain_given_id(chain_id))
+        chain_objects = [blockchain.blockchains.get(chain_id) for chain_id in chains]
+        chain_objects = filter(lambda b: b is not None, chain_objects)
+        names = [b.get_name() for b in chain_objects]
         if len(names) > 1:
             cur_chain = self.network.blockchain().get_name()
             ChoiceDialog(_('Choose your chain'), names, cur_chain, cb).open()
@@ -171,6 +180,7 @@ class ElectrumWindow(App):
 
     def on_history(self, d):
         Logger.info("on_history")
+        self.wallet.clear_coin_price_cache()
         self._trigger_update_history()
 
     def on_fee_histogram(self, *args):
@@ -190,8 +200,8 @@ class ElectrumWindow(App):
         self._trigger_update_status()
         self._trigger_update_history()
 
+    wallet_name = StringProperty(_('No Wallet'))
     base_unit = AliasProperty(_get_bu, _set_bu)
-    status = StringProperty('')
     fiat_unit = StringProperty('')
 
     def on_fiat_unit(self, a, b):
@@ -285,6 +295,7 @@ class ElectrumWindow(App):
             self.auto_connect = net_params.auto_connect
             self.oneserver = net_params.oneserver
             self.proxy_config = net_params.proxy if net_params.proxy else {}
+            self.update_proxy_str(self.proxy_config)
 
         self.plugins = kwargs.get('plugins', [])
         self.gui_object = kwargs.get('gui_object', None)
@@ -304,9 +315,6 @@ class ElectrumWindow(App):
         self._settings_dialog = None
         self._password_dialog = None
         self.fee_status = self.electrum_config.get_fee_status()
-
-    def wallet_name(self):
-        return os.path.basename(self.wallet.storage.path) if self.wallet else ' '
 
     def on_pr(self, pr):
         if not self.wallet:
@@ -544,8 +552,6 @@ class ElectrumWindow(App):
             else:
                 self.load_wallet(wallet)
         else:
-            Logger.debug('Electrum: Wallet not found or action needed. Launching install wizard')
-
             def launch_wizard():
                 storage = WalletStorage(path, manual_upgrades=True)
                 wizard = Factory.InstallWizard(self.electrum_config, self.plugins, storage)
@@ -556,7 +562,6 @@ class ElectrumWindow(App):
                 launch_wizard()
             else:
                 from .uix.dialogs.question import Question
-
                 def handle_answer(b: bool):
                     if b:
                         launch_wizard()
@@ -670,6 +675,7 @@ class ElectrumWindow(App):
         self.tabs = self.root.ids['tabs']
 
     def update_interfaces(self, dt):
+        net_params = self.network.get_parameters()
         self.num_nodes = len(self.network.get_interfaces())
         self.num_chains = len(self.network.get_blockchains())
         chain = self.network.blockchain()
@@ -678,6 +684,10 @@ class ElectrumWindow(App):
         interface = self.network.interface
         if interface:
             self.server_host = interface.host
+        else:
+            self.server_host = str(net_params.host) + ' (connecting...)'
+        self.proxy_config = net_params.proxy or {}
+        self.update_proxy_str(self.proxy_config)
 
     def on_network_event(self, event, *args):
         Logger.info('network event: '+ event)
@@ -702,6 +712,7 @@ class ElectrumWindow(App):
         if self.wallet:
             self.stop_wallet()
         self.wallet = wallet
+        self.wallet_name = wallet.basename()
         self.update_wallet()
         # Once GUI has been initialized check if we want to announce something
         # since the callback has been called before the GUI was initialized
@@ -709,15 +720,19 @@ class ElectrumWindow(App):
             self.receive_screen.clear()
         self.update_tabs()
         run_hook('load_wallet', wallet, self)
+        try:
+            wallet.try_detecting_internal_addresses_corruption()
+        except InternalAddressCorruption as e:
+            self.show_error(str(e))
+            send_exception_to_crash_reporter(e)
 
     def update_status(self, *dt):
-        self.num_blocks = self.network.get_local_height()
         if not self.wallet:
-            self.status = _("No Wallet")
             return
         if self.network is None or not self.network.is_connected():
             status = _("Offline")
         elif self.network.is_connected():
+            self.num_blocks = self.network.get_local_height()
             server_height = self.network.get_server_height()
             server_lag = self.num_blocks - server_height
             if not self.wallet.up_to_date or server_height == 0:
@@ -728,12 +743,14 @@ class ElectrumWindow(App):
                 status = ''
         else:
             status = _("Disconnected")
-        self.status = self.wallet.basename() + (' [size=15dp](%s)[/size]'%status if status else '')
-        # balance
-        c, u, x = self.wallet.get_balance()
-        text = self.format_amount(c+x+u)
-        self.balance = str(text.strip()) + ' [size=22dp]%s[/size]'% self.base_unit
-        self.fiat_balance = self.fx.format_amount(c+u+x) + ' [size=22dp]%s[/size]'% self.fx.ccy
+        if status:
+            self.balance = status
+            self.fiat_balance = status
+        else:
+            c, u, x = self.wallet.get_balance()
+            text = self.format_amount(c+x+u)
+            self.balance = str(text.strip()) + ' [size=22dp]%s[/size]'% self.base_unit
+            self.fiat_balance = self.fx.format_amount(c+u+x) + ' [size=22dp]%s[/size]'% self.fx.ccy
 
     def get_max_amount(self):
         from electrum.transaction import TxOutput
@@ -750,6 +767,10 @@ class ElectrumWindow(App):
             Clock.schedule_once(lambda dt, bound_e=e: self.show_error(str(bound_e)))
             return ''
         except NotEnoughFunds:
+            return ''
+        except InternalAddressCorruption as e:
+            self.show_error(str(e))
+            send_exception_to_crash_reporter(e)
             return ''
         amount = tx.output_value()
         __, x_fee_amount = run_hook('get_tx_extra_fee', self.wallet, tx) or (None, 0)
@@ -778,7 +799,7 @@ class ElectrumWindow(App):
             notification.notify('Electrum', message,
                             app_icon=icon, app_name='Electrum')
         except ImportError:
-            Logger.Error('Notification: needs plyer; `sudo pip install plyer`')
+            Logger.Error('Notification: needs plyer; `sudo python3 -m pip install plyer`')
 
     def on_pause(self):
         self.pause_time = time.time()
@@ -916,8 +937,11 @@ class ElectrumWindow(App):
                     self.wallet.invoices.save()
                     self.update_tab('invoices')
             else:
-                msg = msg[:500] if msg else _('There was an error broadcasting the transaction.')
-                self.show_error(msg)
+                display_msg = _('The server returned an error when broadcasting the transaction.')
+                if msg:
+                    display_msg += '\n' + msg
+                display_msg = display_msg[:500]
+                self.show_error(display_msg)
 
         if self.network and self.network.is_connected():
             self.show_info(_('Sending'))

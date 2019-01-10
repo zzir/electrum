@@ -251,11 +251,16 @@ class BasePlugin(PrintError):
 
     def close(self):
         # remove self from hooks
-        for k in dir(self):
-            if k in hook_names:
-                l = hooks.get(k, [])
-                l.remove((self, getattr(self, k)))
-                hooks[k] = l
+        for attr_name in dir(self):
+            if attr_name in hook_names:
+                # found attribute in self that is also the name of a hook
+                l = hooks.get(attr_name, [])
+                try:
+                    l.remove((self, getattr(self, attr_name)))
+                except ValueError:
+                    # maybe attr name just collided with hook name and was not hook
+                    continue
+                hooks[attr_name] = l
         self.parent.close_plugin(self)
         self.on_close()
 
@@ -291,6 +296,7 @@ class Device(NamedTuple):
     id_: str
     product_key: Any   # when using hid, often Tuple[int, int]
     usage_page: int
+    transport_ui_string: str
 
 
 class DeviceInfo(NamedTuple):
@@ -576,8 +582,12 @@ class DeviceMgr(ThreadJob, PrintError):
                 if len(id_) == 0:
                     id_ = str(d['path'])
                 id_ += str(interface_number) + str(usage_page)
-                devices.append(Device(d['path'], interface_number,
-                                      id_, product_key, usage_page))
+                devices.append(Device(path=d['path'],
+                                      interface_number=interface_number,
+                                      id_=id_,
+                                      product_key=product_key,
+                                      usage_page=usage_page,
+                                      transport_ui_string='hid'))
         return devices
 
     def scan_devices(self):
